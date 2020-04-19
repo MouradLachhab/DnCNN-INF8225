@@ -109,6 +109,9 @@ def train_model(model, epochs=50, lr=1e-1): # Need to check how to implement exp
     best_psnr = 0.0
     best_model = None
 
+    decayRate = 0.96
+    my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=my_optim, gamma=decayRate)
+
     for epoch in range(1, epochs + 1):
         model, loss_training = train(model, optimizer, criterion)
         psnr_validation, loss_validation = validation(model, criterion)
@@ -116,5 +119,8 @@ def train_model(model, epochs=50, lr=1e-1): # Need to check how to implement exp
         if psnr_validation > best_psnr:
             best_psnr = psnr_validation
             best_model = model
+            
+        my_lr_scheduler.step()
+
 
     return best_model, best_psnr
