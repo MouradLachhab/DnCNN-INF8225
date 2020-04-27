@@ -53,7 +53,7 @@ def train(model, optimizer, criterion, purpose):
 
         loss.backward()
         optimizer.step()
-        break
+
     return model, loss_training
 
 def validation(model, criterion, purpose):
