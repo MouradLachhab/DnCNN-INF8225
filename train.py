@@ -1,126 +1,168 @@
+import os
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+from models import DnCNN
 from torch.utils.data import DataLoader
 from dataset import prepare_data, Dataset
 from torch.autograd import Variable
-import numpy as np
 from skimage.measure.simple_metrics import compare_psnr
+from utils import add_mask, add_noise, calculate_PSNR, findLastLoss, findLastPSNR, show_tensor, weights_init_kaiming
+from datetime import datetime
+
+save_dir = "./models/"
+model_name = save_dir + "best_model.pth"
 
 train_data = Dataset(train=True)
-
 valid_data = Dataset(train=False)
-
 train_loader = DataLoader(dataset=train_data, num_workers=4, batch_size=128, shuffle=True)
 
-def calculate_PSNR(noised_image, clean_image):
-    noised_image_cpu = noised_image.data.cpu().numpy().astype(np.float32)
-    clean_image_cpu = clean_image.data.cpu().numpy().astype(np.float32)
-    PSNR = 0
-    for i in range(noised_image_cpu.shape[0]):
-        # function from skimage to calculate PSNR between 2 images
-        # data range is use to know the maximum value of the pixel
-        PSNR += compare_psnr(clean_image_cpu[i,:,:,:], noised_image_cpu[i,:,:,:], data_range=1.) 
-    
-    # return mean PSNR between images
-    return (PSNR/noised_image_cpu.shape[0])
+train_data_masks = Dataset(train=True, mask=True)
+valid_data_masks = Dataset(train=False, mask=True)
+mask_loader = DataLoader(dataset=train_data_masks, num_workers=4, batch_size=128, shuffle=True)
+valid__mask_loader = DataLoader(dataset=valid_data_masks, num_workers=1, batch_size=12, shuffle=True)
 
-def train(model, optimizer, criterion):
+def train(model, optimizer, criterion, purpose):
+    print("Train Current Time =", datetime.now().strftime("%H:%M:%S"))
     model.train()
-    model.zero_grad()
-    optimizer.zero_grad()
+
     loss_training = 0.0
-    noise_level=50 # 15,25, 50 sont discuté dans le text. On pourra le rendre optionnel plus tard.
-
-    # Training with SGD ?
+    mask_loader_2 = iter(mask_loader) 
     for batch_idx, data in enumerate(train_loader, 0):
-        noise = torch.FloatTensor(data.size()).normal_(mean=0, std=noise_level/255.)
-        noised_image = data + noise
-        # sending values to GPU
-        noised_image, data = Variable(noised_image.cuda()), Variable(data.cuda())
-        noise = Variable(noise.cuda())
-
-        # Running Model
-        output = model(noised_image)
-
-        # TODO: Calculate loss
-        loss = criterion(output, noise) / (noised_image.size()[0]*2)
-        loss.backward()
-        optimizer.step()
-
-        # Le github a model(imgn_train) a la place de output pour X raison. A tester
-        # Maybe because they run the backpropagation just before, so they are doing 1 step ahead ?
-        # I think in the end there is no difference, we will just be 1 step behind all the time on accuracy
-        # This step also seems to be optional as it is only used for results on screen to show progress
-        # Calculer l'image denoised
-        model.eval()
-        denoised_image = torch.clamp(noised_image-output, 0., 1.) 
-        psnr = calculate_PSNR(denoised_image, data)
-        
         optimizer.zero_grad()
-        output = model(data)  # calls the forward function
+        model.zero_grad()
+
+        if purpose == 'noise':
+            altered_image, noise = add_noise(data)
+        else:
+            masks = next(mask_loader_2)
+            altered_image, data = add_mask(data, masks)
+
+        altered_image, data = Variable(altered_image.cuda()), Variable(data.cuda())
+
+        output = model(altered_image)
+
+        if purpose == 'noise':
+            loss = criterion(output, noise) / (altered_image.size()[0]*2)
+            reconstructed_image = torch.clamp(altered_image-output, 0., 1.) 
+            psnr = calculate_PSNR(reconstructed_image, data)
+        else:
+            loss = criterion(output, data)
+
         loss.backward()
         optimizer.step()
-
-    loss_training /= len(train_data) # averaging the loss for this epoch
-
+        break
     return model, loss_training
 
-def validation(model, criterion):
+def validation(model, criterion, purpose):
+    print("Validate")
     model.eval()
 
     psnr_validation = 0
     loss_validation = 0.0
-    noise_level=50 # 15,25, 50 sont discuté dans le text. On pourra le rendre optionnel plus tard.
 
-    for i in range(len(valid_data)): # Placeholder loop
-        image = torch.unsqueeze(valid_data[i], 0)
-        noise = torch.FloatTensor(image.size()).normal_(mean=0, std=noise_level/255.)
-        noised_image = image + noise
+    valid__mask_loader_2 = iter(valid__mask_loader) 
 
-        # sending values to GPU
-        noised_image, image = Variable(noised_image.cuda()), Variable(image.cuda())
+    for batch_idx, data in enumerate(valid_loader, 0):
+        print(data.size())
+        if purpose == 'noise':
+            image = torch.unsqueeze(image, 0)
+            altered_image, noise = add_noise(image)
 
-        # Running Model
-        output = model(noised_image)
+        else:
+            masks = next(valid__mask_loader_2)
+            altered_image, image = add_mask(data, masks)
+        
+        altered_image, image = Variable(altered_image.cuda()), Variable(image.cuda())
 
-        # Calculer l'image denoised
-        denoised_image = torch.clamp(noised_image-output, 0., 1.) 
-        psnr_validation += calculate_PSNR(denoised_image, image)
+        output = model(altered_image)
 
-        loss = criterion(output, noise) / (noised_image.size()[0]*2)
+        if purpose == 'noise':
+            loss = criterion(output, noise) / (altered_image.size()[0]*2)
+            reconstructed_image = torch.clamp(altered_image-output, 0., 1.) 
+            psnr_validation += calculate_PSNR(reconstructed_image, image)
+        else:
+            loss = criterion(output, image)
+
+        for i in range(data.size()[0]):
+            show_tensor("Original", data[i])
+
+            if purpose == 'noise':
+                show_tensor("Noise", noise[i])
+                show_tensor("Predicted Noise", output[i])
+                show_tensor("Noisy Image", altered_image[i])
+                show_tensor("Denoised", reconstructed_image[i])
+            else:
+                show_tensor("Mask", masks[i])
+                show_tensor("Masked image", altered_image[i])
+                show_tensor("Filled", output[i])
+
         loss_validation += loss.item()
-
-    loss_validation /= len(valid_data)
-    psnr_validation /= len(valid_data)
 
     return psnr_validation, loss_validation
 
 
-def train_model(model, epochs=50, lr=1e-1): # Need to check how to implement exponential decay
+def train_model(epochs=50, lr=1e-2, purpose='noise', load = False): 
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
+    if load:
+        print("loading model")
+        if purpose == "noise":
+            best_psnr = findLastPSNR(save_dir)
+            model = torch.load(save_dir + "best_model_%03d.pth" %(int(best_psnr)))
+            best_model = model
+        elif purpose == "filling":
+            best_loss = findLastLoss(save_dir)/1000
+            model = torch.load(save_dir + "best_model_%03d.pth" %(int(best_loss)))
+            best_model = model
+        print("model loaded")
+
+    elif purpose == 'noise' or purpose == 'filling':
+        model = DnCNN(channels=1)
+        model.apply(weights_init_kaiming)
+        best_psnr = 0.0
+        best_loss = 9999999
+        best_model = None
+    else:
+        print("Invalid model")
+        return
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    # Mode to GPU
     device_ids = [0]
     model = nn.DataParallel(model, device_ids=device_ids).cuda()
     criterion.cuda()
 
-    best_psnr = 0.0
-    best_model = None
-
-    decayRate = 0.96
-    my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=my_optim, gamma=decayRate)
-
     for epoch in range(1, epochs + 1):
-        model, loss_training = train(model, optimizer, criterion)
-        psnr_validation, loss_validation = validation(model, criterion)
+        model, loss_training = train(model, optimizer, criterion, purpose)
+        psnr_validation, loss_validation = validation(model, criterion, purpose)
+        if epoch < 30:
+            current_lr = lr
+        else:
+            current_lr = lr / 2.
 
-        if psnr_validation > best_psnr:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
+        print("[epoch %d]loss: %.4f PSNR_validation: %.4f" % (epoch, loss_validation, psnr_validation))
+
+        if (psnr_validation > best_psnr and purpose=='noise') or (purpose=='filling' and loss_validation < best_loss):
             best_psnr = psnr_validation
             best_model = model
-            
-        my_lr_scheduler.step()
+            best_loss = loss_validation
+            print("saving model")
+            suffix = 0
+            if purpose == "noise":
+                suffix = int(best_psnr)
+            elif purpose == "filling":
+                suffix = int(best_loss * 1000)
 
-
+            model_name = os.path.join(save_dir, "best_model_%03d.pth" % (suffix))
+            if os.path.exists(model_name):
+                os.remove(model_name)
+            torch.save(model, model_name)     
     return best_model, best_psnr
